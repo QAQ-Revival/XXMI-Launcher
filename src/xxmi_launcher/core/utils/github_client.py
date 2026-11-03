@@ -8,6 +8,7 @@ from requests.exceptions import SSLError
 
 from core.locale_manager import L
 from core.utils.proxy import ProxyConfig, ProxyManager
+from core.utils.github_release_page import fetch_release_page
 
 
 @dataclass
@@ -37,6 +38,19 @@ class GitHubClient:
         if proxy_config is not None:
             self.proxy_manager.configure(proxy_config)
 
+    def _get_release_page(self, url):
+        # One retry for a transient connection failure; retain the configured
+        # proxy and certificate checks, and never send API tokens to web pages.
+        for attempt in range(2):
+            try:
+                return requests.get(url, proxies=self.proxy_manager.proxies,
+                                    timeout=10, verify=self.verify_ssl)
+            except SSLError:
+                raise
+            except (requests.ConnectionError, requests.Timeout):
+                if attempt:
+                    raise
+
     def fetch_latest_release(self, repo_owner, repo_name,
                              asset_version_pattern, asset_name_format, signature_pattern=None, pre_release=False):
         headers = {}
@@ -45,13 +59,28 @@ class GitHubClient:
             headers['Authorization'] = f'token {self.access_token}'
 
         try:
-            response = requests.get(
-                url=f'https://api.github.com/repos/{repo_owner}/{repo_name}/releases{"/latest" if not pre_release else ""}',
-                headers=headers,
-                proxies=self.proxy_manager.proxies,
-                timeout=10,
-                verify=self.verify_ssl
-            ).json()
+            try:
+                response = requests.get(
+                    url=f'https://api.github.com/repos/{repo_owner}/{repo_name}/releases{"/latest" if not pre_release else ""}',
+                    headers=headers,
+                    proxies=self.proxy_manager.proxies,
+                    timeout=10,
+                    verify=self.verify_ssl
+                )
+                # Let the existing token error below handle rejected credentials.
+                if response.status_code != 401:
+                    response.raise_for_status()
+                response = response.json()
+            except SSLError:
+                raise
+            except (requests.RequestException, ValueError):
+                # /latest follows GitHub's stable-release selection. It cannot
+                # substitute for the API's pre-release list.
+                if pre_release:
+                    raise
+                response = fetch_release_page(
+                    self._get_release_page, repo_owner, repo_name
+                )
         except SSLError as e:
             raise ValueError(L('error_ssl_certificate_validation_failed', """
                  Failed to validate SSL certificate of GitHub HTTPS connection!
